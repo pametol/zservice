@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import ast
+import json
 import logging
 import re
 import redis
@@ -15,7 +16,7 @@ for handler in logging.root.handlers:
 
 
 def string2dict(string, object_type):
-    '''Converts string to dictionary and checks it for the list of keys'''
+    """Converts string to dictionary and checks it for the list of keys"""
     if object_type == 'items':
         keys = ['name', 'key_', 'type', 'value_type', 'delay']
     elif object_type == 'triggers':
@@ -36,7 +37,7 @@ def string2dict(string, object_type):
 
 
 def get_hostid_by_name(hostname):
-    '''Returns host ID for given hostname'''
+    """Returns host ID for given hostname"""
     hostid = zapi.host.get({'filter':{'host': hostname}, 'output':['host']})
     if len(hostid) > 1:
         raise Exception('More then one host with such name: {0}'.format(hostname))
@@ -53,7 +54,7 @@ def get_hostid_by_name(hostname):
 
 
 def get_templateid_by_name(template_name):
-    '''Returns template ID for given name'''
+    """Returns template ID for given name"""
     try:
         template = zapi.template.get({'filter': {'host': template_name}, 'output': 'templateid'})
     except ZabbixAPIException:
@@ -70,14 +71,14 @@ def get_templateid_by_name(template_name):
 
 
 def get_groupid_by_name(group):
-    '''Returns group ID for given groupname'''
+    """Returns group ID for given groupname"""
     group = zapi.hostgroup.get({'filter': {'name': group}, 'output': 'host'})
 
     return group[0]['groupid']
 
 
 def create_zabbix_host(hostname):
-    '''Creates host in zabbix and returns its ID'''
+    """Creates host in zabbix and returns its ID"""
     group = hostname.split('.')[1]
     group_id = get_groupid_by_name(group)
 
@@ -105,7 +106,7 @@ def create_zabbix_host(hostname):
 
 
 def create_zabbix_item(item_dict, host_id):
-    '''Creates item (from dictionary) for given host (ID)'''
+    """Creates item (from dictionary) for given host (ID)"""
     host_interface = zapi.hostinterface.get({'filter':{'hostid': host_id}})
     if host_interface:
         interface = host_interface[0]["interfaceid"]
@@ -151,7 +152,7 @@ def create_zabbix_item(item_dict, host_id):
 
 
 def create_zabbix_trigger(trigger_dict, hostname):
-    '''Creates trigger (from dictionary) '''
+    """Creates trigger (from dictionary) """
     expression = re.sub ('HOST_PLACEHOLDER', hostname, trigger_dict['expression'])
     try:
         trigger=zapi.trigger.create({
@@ -191,7 +192,7 @@ def create_zabbix_trigger(trigger_dict, hostname):
 
 
 def assign_zabbix_templates(templates_names, host_id):
-    '''Assigns zabbix template to host'''
+    """Assigns zabbix template to host"""
     templates_list = []
     current_templates = zapi.template.get({'hostids': host_id, 'output': 'templateid'})
     for template in current_templates:
@@ -220,7 +221,7 @@ def assign_zabbix_templates(templates_names, host_id):
 
 
 def fix_zabbix_templates(templates_names, host_id):
-    '''Replaces zabbix template with given list'''
+    """Replaces zabbix template with given list"""
     templates_list = []
 
     for template_name in templates_names:
@@ -245,7 +246,7 @@ def fix_zabbix_templates(templates_names, host_id):
         return False
 
 def remove_zabbix_template(template_name, host_id):
-    '''Assigns zabbix template to host'''
+    """Assigns zabbix template to host"""
     logger.info('Going to remove template {}'.format(template_name))
 
     templateid = get_templateid_by_name(template_name)
@@ -362,11 +363,29 @@ def Redis_handler(message):
 
 
 if __name__ == "__main__":
-    zapi = ZabbixAPI("https://zabbix.zabbix")
-    zapi.login("login", "pass")
-    logger.info ("Connected to Zabbix API Version %s"%zapi.api_version())
+    server_config = '/etc/zservice/zservice_server.conf'
+    if os.path.isfile (server_config):
+        with open(server_config) as f:
+            configuration = json.load(f)
+    else:
+        logger.error('Configuration file {} not found'.format(server_config))
+        sys.exit()
 
-    r = redis.Redis(host='redis', port=6379, db=0)
+    try:
+        zabbix_server = configuration['zabbix_server']
+        zabbix_login = configuration['zabbix_login']
+        zabbix_password = configuration['zabbix_password']
+        redis_host = configuration['redis_host']
+        redis_port = configuration['redis_port']
+    except KeyError as e:
+        logger.error('Not found in config: {}'.format(e))
+        sys.exit()
+
+    zapi = ZabbixAPI(zabbix_server)
+    zapi.login(zabbix_login, zabbix_password)
+    logger.info ('Connected to Zabbix API Version {}'.format(zapi.api_version()))
+
+    r = redis.Redis(host=redis_host, port=redis_port, db=0)
     p = r.pubsub(ignore_subscribe_messages=True)
     p.subscribe(**{'notify-channel': Redis_handler})
     logger.info(p.get_message())
