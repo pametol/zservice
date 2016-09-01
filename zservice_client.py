@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import redis
+import signal
 import shutil
 import socket
 import sys
@@ -22,6 +23,22 @@ for handler in logging.root.handlers:
     handler.addFilter(logging.Filter('zservice'))
 
 
+class GracefulKiller:
+    """Catch signals to allow graceful shutdown."""
+
+    def __init__(self):
+        self.receivedSignal = self.receivedTermSignal = False
+        catchSignals = [1, 2, 3, 10, 12, 15]
+        for signum in catchSignals:
+            signal.signal(signum, self.handler)
+
+    def handler(self, signum, frame):
+        self.lastSignal = signum
+        self.receivedSignal = True
+        if signum in [2, 3, 15]:
+            self.receivedTermSignal = True
+
+
 class file_changes(FileSystemEventHandler):
 
     def on_modified(self, event):
@@ -33,6 +50,12 @@ class file_changes(FileSystemEventHandler):
 
         elif not event.is_directory and ('templates' in event.src_path) and ('lock' not in event.src_path) and ('replacement' not in event.src_path):
             process_changes('templates')
+
+        elif not event.is_directory and ('urotate_tasks' in event.src_path) and ('lock' not in event.src_path):
+            process_urotate()
+
+        elif not event.is_directory and ('zabbix_macro' in event.src_path) and ('lock' not in event.src_path):
+            process_macro()
 
         elif not event.is_directory and ('templates_replacements' in event.src_path) and ('lock' not in event.src_path):
             regular_check('templates')
@@ -103,6 +126,59 @@ def process_replacements(item_list, item_type):
     return item_list_replaced
 
 
+def process_urotate():
+    hostname = socket.gethostname()
+    tasks_file = os.path.join(monitoring_dir, 'urotate_tasks')
+
+    if not os.path.isfile(tasks_file):
+
+        return None
+
+    pipe = r.pipeline()
+    with open(tasks_file) as f:
+        lines = [line.rstrip('\n') for line in f]
+
+    for line in lines:
+        task_name = line.split()[0]
+        nodata = line.split()[1]
+        hash_key = hostname + ':urotate_tasks'
+        pipe.hset(hash_key, task_name, nodata)
+
+    pipe.execute()
+    notify_backend('urotate_tasks')
+
+def process_macro():
+    hostname = socket.gethostname()
+    macro_file = os.path.join(monitoring_dir, 'zabbix_macro')
+    hash_key = hostname + ':zabbix_macro'
+    keys = r.hkeys(hash_key)
+    macro_names = []
+    redis_keys = []
+
+    if not os.path.isfile(macro_file):
+
+        return None
+
+    pipe = r.pipeline()
+    with open(macro_file) as f:
+        lines = [line.rstrip('\n') for line in f]
+
+    for line in lines:
+        macro_name = line.split()[0]
+        macro_value = line.split()[1]
+        macro_names.append(macro_name)
+        pipe.hset(hash_key, macro_name, macro_value)
+
+    for k in keys:
+        k = k.decode('utf-8')
+        redis_keys.append(k)
+
+    keys_2_remove = [k for k in redis_keys if k not in macro_names]
+    for k in keys_2_remove:
+        pipe.hdel(hash_key, k)
+        
+    pipe.execute()
+    notify_backend('zabbix_macro')
 
 def regular_check(item_type):
     """ Pushes current file to redis and notifies server """
@@ -205,6 +281,8 @@ if __name__ == "__main__":
         logger.error('Not found in config: {}'.format(e))
         sys.exit()
 
+    killer = GracefulKiller()
+
     r = redis.Redis(host=redis_host, port=redis_port, db=0)
     event_handler = file_changes()
     observer = Observer()
@@ -213,12 +291,23 @@ if __name__ == "__main__":
 
     try:
         while True:
+            if killer.receivedSignal:
+                if killer.receivedTermSignal:
+                    logging.warning("Gracefully exiting due to receipt of signal {}".format(killer.lastSignal))
+                    sys.exit()
+                else:
+                    logging.warning("Ignoring signal {}".format(killer.lastSignal))
+                    killer.receivedSignal = killer.receivedTermSignal = False
+
             time_counter += 0.01
             if time_counter > 60:
                 regular_check('templates')
+                process_urotate()
+                process_macro()
                 time_counter = 0
 
             time.sleep(0.01)
+
     except KeyboardInterrupt:
         observer.stop()
     observer.join()
